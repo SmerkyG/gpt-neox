@@ -7,109 +7,112 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.cpp_extension import load
+USE_FLA = False
+try:
+    from fla.ops.rwkv6.recurrent_fuse import fused_recurrent_rwkv6
+    USE_FLA = True
+except:
+    class WKV(torch.autograd.Function):
+        """
+        WKV block, using cuda kernel.
+        """
+
+        @staticmethod
+        def forward(ctx, B, T, C, H, r, k, v, w, u):
+            with torch.no_grad():
+                ctx.B = B
+                ctx.T = T
+                ctx.C = C
+                ctx.H = H
+                dtype = r.dtype
+                ctx.dtype = dtype
+                assert dtype == k.dtype
+                assert dtype == v.dtype
+                assert dtype == w.dtype
+                assert dtype == u.dtype
+                assert r.is_contiguous()
+                assert k.is_contiguous()
+                assert v.is_contiguous()
+                assert w.is_contiguous()
+                assert u.is_contiguous()
+                ctx.save_for_backward(r, k, v, w, u)
+                y = torch.empty(
+                    (B, T, C),
+                    device=r.device,
+                    dtype=dtype,
+                    memory_format=torch.contiguous_format,
+                )  # .uniform_(-100, 100)
+                if dtype == torch.bfloat16:
+                    wkv6_cuda.forward_bf16(B, T, C, H, r, k, v, w, u, y)
+                elif dtype == torch.float16:
+                    wkv6_cuda.forward_fp16(B, T, C, H, r, k, v, w, u, y)
+                elif dtype == torch.float32:
+                    wkv6_cuda.forward_fp32(B, T, C, H, r, k, v, w, u, y)
+                else:
+                    raise ValueError(f"Unsupported dtype {dtype} for WKV6_CUDA")
+                return y
+
+        @staticmethod
+        def backward(ctx, gy):
+            with torch.no_grad():
+                assert gy.dtype == torch.bfloat16
+                B = ctx.B
+                T = ctx.T
+                C = ctx.C
+                H = ctx.H
+                dtype = ctx.dtype
+                assert gy.dtype == dtype
+                assert gy.is_contiguous()
+                r, k, v, w, u = ctx.saved_tensors
+                gr = torch.empty(
+                    (B, T, C),
+                    device=gy.device,
+                    requires_grad=False,
+                    dtype=dtype,
+                    memory_format=torch.contiguous_format,
+                )  # .uniform_(-100, 100)
+                gk = torch.empty(
+                    (B, T, C),
+                    device=gy.device,
+                    requires_grad=False,
+                    dtype=dtype,
+                    memory_format=torch.contiguous_format,
+                )  # .uniform_(-100, 100)
+                gv = torch.empty(
+                    (B, T, C),
+                    device=gy.device,
+                    requires_grad=False,
+                    dtype=dtype,
+                    memory_format=torch.contiguous_format,
+                )  # .uniform_(-100, 100)
+                gw = torch.empty(
+                    (B, T, C),
+                    device=gy.device,
+                    requires_grad=False,
+                    dtype=dtype,
+                    memory_format=torch.contiguous_format,
+                )  # .uniform_(-100, 100)
+                gu = torch.empty(
+                    (B, C),
+                    device=gy.device,
+                    requires_grad=False,
+                    dtype=dtype,
+                    memory_format=torch.contiguous_format,
+                )  # .uniform_(-100, 100)
+                if dtype == torch.bfloat16:
+                    wkv6_cuda.backward_bf16(B, T, C, H, r, k, v, w, u, gy, gr, gk, gv, gw, gu)
+                elif dtype == torch.float16:
+                    wkv6_cuda.backward_fp16(B, T, C, H, r, k, v, w, u, gy, gr, gk, gv, gw, gu)
+                elif dtype == torch.float32:
+                    wkv6_cuda.backward_fp32(B, T, C, H, r, k, v, w, u, gy, gr, gk, gv, gw, gu)
+                else:
+                    raise ValueError(f"Unsupported dtype {dtype} for WKV6_CUDA")
+                gu = torch.sum(gu, 0).view(H, C // H)
+                return (None, None, None, None, gr, gk, gv, gw, gu)
 
 
-class WKV(torch.autograd.Function):
-    """
-    WKV block, using cuda kernel.
-    """
-
-    @staticmethod
-    def forward(ctx, B, T, C, H, r, k, v, w, u):
-        with torch.no_grad():
-            ctx.B = B
-            ctx.T = T
-            ctx.C = C
-            ctx.H = H
-            dtype = r.dtype
-            ctx.dtype = dtype
-            assert dtype == k.dtype
-            assert dtype == v.dtype
-            assert dtype == w.dtype
-            assert dtype == u.dtype
-            assert r.is_contiguous()
-            assert k.is_contiguous()
-            assert v.is_contiguous()
-            assert w.is_contiguous()
-            assert u.is_contiguous()
-            ctx.save_for_backward(r, k, v, w, u)
-            y = torch.empty(
-                (B, T, C),
-                device=r.device,
-                dtype=dtype,
-                memory_format=torch.contiguous_format,
-            )  # .uniform_(-100, 100)
-            if dtype == torch.bfloat16:
-                wkv6_cuda.forward_bf16(B, T, C, H, r, k, v, w, u, y)
-            elif dtype == torch.float16:
-                wkv6_cuda.forward_fp16(B, T, C, H, r, k, v, w, u, y)
-            elif dtype == torch.float32:
-                wkv6_cuda.forward_fp32(B, T, C, H, r, k, v, w, u, y)
-            else:
-                raise ValueError(f"Unsupported dtype {dtype} for WKV6_CUDA")
-            return y
-
-    @staticmethod
-    def backward(ctx, gy):
-        with torch.no_grad():
-            assert gy.dtype == torch.bfloat16
-            B = ctx.B
-            T = ctx.T
-            C = ctx.C
-            H = ctx.H
-            dtype = ctx.dtype
-            assert gy.dtype == dtype
-            assert gy.is_contiguous()
-            r, k, v, w, u = ctx.saved_tensors
-            gr = torch.empty(
-                (B, T, C),
-                device=gy.device,
-                requires_grad=False,
-                dtype=dtype,
-                memory_format=torch.contiguous_format,
-            )  # .uniform_(-100, 100)
-            gk = torch.empty(
-                (B, T, C),
-                device=gy.device,
-                requires_grad=False,
-                dtype=dtype,
-                memory_format=torch.contiguous_format,
-            )  # .uniform_(-100, 100)
-            gv = torch.empty(
-                (B, T, C),
-                device=gy.device,
-                requires_grad=False,
-                dtype=dtype,
-                memory_format=torch.contiguous_format,
-            )  # .uniform_(-100, 100)
-            gw = torch.empty(
-                (B, T, C),
-                device=gy.device,
-                requires_grad=False,
-                dtype=dtype,
-                memory_format=torch.contiguous_format,
-            )  # .uniform_(-100, 100)
-            gu = torch.empty(
-                (B, C),
-                device=gy.device,
-                requires_grad=False,
-                dtype=dtype,
-                memory_format=torch.contiguous_format,
-            )  # .uniform_(-100, 100)
-            if dtype == torch.bfloat16:
-                wkv6_cuda.backward_bf16(B, T, C, H, r, k, v, w, u, gy, gr, gk, gv, gw, gu)
-            elif dtype == torch.float16:
-                wkv6_cuda.backward_fp16(B, T, C, H, r, k, v, w, u, gy, gr, gk, gv, gw, gu)
-            elif dtype == torch.float32:
-                wkv6_cuda.backward_fp32(B, T, C, H, r, k, v, w, u, gy, gr, gk, gv, gw, gu)
-            else:
-                raise ValueError(f"Unsupported dtype {dtype} for WKV6_CUDA")
-            gu = torch.sum(gu, 0).view(H, C // H)
-            return (None, None, None, None, gr, gk, gv, gw, gu)
-
-
-def RUN_CUDA_RWKV(B, T, C, H, r, k, v, w, u):
-    return WKV.apply(B, T, C, H, r, k, v, w, u)
+    def RUN_CUDA_RWKV(B, T, C, H, r, k, v, w, u):
+        return WKV.apply(B, T, C, H, r, k, v, w, u)
 
 
 # RWKV6 time mix
@@ -239,7 +242,16 @@ class RWKV_TimeMix(nn.Module):
         H = self.neox_args.num_attention_heads
 
         r, k, v, g, w = self.jit_func(x)
-        x = RUN_CUDA_RWKV(B, T, C, H, r, k, v, w, u=self.time_faaaa)
+        u = self.time_faaaa
+        if USE_FLA:
+            w = -w.exp()
+            r = r.view(B,T,H,-1).transpose(1,2).view(B,H,T,-1)
+            k = k.view(B,T,H,-1).transpose(1,2).view(B,H,T,-1)
+            v = v.view(B,T,H,-1).transpose(1,2).view(B,H,T,-1)
+            x, _ = fused_recurrent_rwkv6(r, k, v, w, u, scale=-1, initial_state=None, output_final_state=False, causal=True)
+            x = x.transpose(1,2).view(B,T,H,-1).reshape(B,T,-1)
+        else:
+            x = RUN_CUDA_RWKV(B, T, C, H, r, k, v, w, u)
 
         return self.jit_func_2(x, g)
 
